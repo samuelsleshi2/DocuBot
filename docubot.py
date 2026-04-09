@@ -10,6 +10,21 @@ Core DocuBot class responsible for:
 import os
 import glob
 
+_STOP_WORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+    "should", "may", "might", "can", "could", "to", "of", "in", "for",
+    "on", "with", "at", "by", "from", "as", "into", "about", "and", "or",
+    "but", "if", "so", "it", "its", "this", "that", "these", "those",
+    "i", "my", "me", "we", "our", "you", "your", "what", "how", "where",
+    "when", "why", "who", "which", "not", "no", "get", "make", "up",
+    "than", "then", "there", "here", "just", "also", "more", "very"
+}
+
+_MIN_SCORE = 3          # top snippet must score at least this to count as evidence
+_MIN_COVERAGE_RATIO = 0.25  # at least 25% of meaningful query words must exist in the index
+
+
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
         """
@@ -64,7 +79,15 @@ class DocuBot:
         ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for filename, text in documents:
+            for token in text.split():
+                word = token.lower().strip(".,!?;:\"'()[]{}")
+                if not word:
+                    continue
+                if word not in index:
+                    index[word] = []
+                if filename not in index[word]:
+                    index[word].append(filename)
         return index
 
     # -----------------------------------------------------------
@@ -81,8 +104,20 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        query_words = [w.lower().strip(".,!?;:\"'()[]{}") for w in query.split()]
+        query_words = [w for w in query_words if w]
+
+        text_words = [w.lower().strip(".,!?;:\"'()[]{}") for w in text.split()]
+        text_words = [w for w in text_words if w]
+
+        # How many times each query word appears in the text (frequency)
+        frequency_score = sum(text_words.count(word) for word in query_words)
+
+        # How many unique query words are covered (coverage)
+        text_word_set = set(text_words)
+        coverage_score = sum(1 for word in set(query_words) if word in text_word_set)
+
+        return frequency_score + coverage_score
 
     def retrieve(self, query, top_k=3):
         """
@@ -92,8 +127,75 @@ class DocuBot:
         Return a list of (filename, text) sorted by score descending.
         """
         results = []
-        # TODO: implement retrieval logic
+
+        # Use the index to find candidate documents that contain query words
+        query_words = [w.lower().strip(".,!?;:\"'()[]{}") for w in query.split()]
+        query_words = [w for w in query_words if w]
+
+        candidate_filenames = set()
+        for word in query_words:
+            if word in self.index:
+                candidate_filenames.update(self.index[word])
+
+        # Score each candidate document and add the best matching paragraph
+        for filename, text in self.documents:
+            if filename in candidate_filenames:
+                paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+                best = max(paragraphs, key=lambda p: self.score_document(query, p))
+                score = self.score_document(query, best)
+                if score > 0:
+                    results.append((filename, best, score))
+
+        # Sort by score descending, then strip the score before returning
+        results.sort(key=lambda x: x[2], reverse=True)
+        results = [(filename, text) for filename, text, _ in results]
+
         return results[:top_k]
+
+    # -----------------------------------------------------------
+    # Confidence Check
+    # -----------------------------------------------------------
+
+    def _refusal_reason(self, query, results):
+        """
+        Returns a refusal message string if the query cannot be answered
+        confidently, or None if the results look sufficient.
+
+        Catches:
+        - Too vague: no meaningful (non-stop-word) terms in the query
+        - Out of scope: fewer than 25% of meaningful terms exist in the index
+        - Too complex / weak match: top snippet score is below the minimum threshold
+        - No evidence: retrieval returned nothing
+        """
+        all_words = [w.lower().strip(".,!?;:\"'()[]{}") for w in query.split()]
+        meaningful = [w for w in all_words if w and w not in _STOP_WORDS]
+
+        if not meaningful:
+            return (
+                "Your query is too vague. "
+                "Please ask a specific question about the documentation."
+            )
+
+        covered = sum(1 for w in meaningful if w in self.index)
+        coverage_ratio = covered / len(meaningful)
+
+        if coverage_ratio < _MIN_COVERAGE_RATIO:
+            return (
+                "That topic does not appear to be covered in the available docs. "
+                "I don't have enough relevant information to answer."
+            )
+
+        if not results:
+            return "I could not find any relevant information in the docs for that query."
+
+        top_score = self.score_document(query, results[0][1])
+        if top_score < _MIN_SCORE:
+            return (
+                "The available documentation mentions this topic only in passing. "
+                "I don't have enough context to give a reliable answer."
+            )
+
+        return None
 
     # -----------------------------------------------------------
     # Answering Modes
@@ -106,8 +208,9 @@ class DocuBot:
         """
         snippets = self.retrieve(query, top_k=top_k)
 
-        if not snippets:
-            return "I do not know based on these docs."
+        refusal = self._refusal_reason(query, snippets)
+        if refusal:
+            return refusal
 
         formatted = []
         for filename, text in snippets:
@@ -128,8 +231,9 @@ class DocuBot:
 
         snippets = self.retrieve(query, top_k=top_k)
 
-        if not snippets:
-            return "I do not know based on these docs."
+        refusal = self._refusal_reason(query, snippets)
+        if refusal:
+            return refusal
 
         return self.llm_client.answer_from_snippets(query, snippets)
 
